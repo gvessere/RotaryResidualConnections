@@ -76,7 +76,7 @@ class CayleyHyperConnection(nn.Module):
         B, T, n, D = streams.shape
 
         x_avg = streams.mean(dim=2)
-        gates = self.gate_proj(self.norm(x_avg.float()).to(streams.dtype))
+        gates = self.gate_proj(self.norm(x_avg).float().to(streams.dtype))
         pre_raw, post_raw, res_raw = gates.chunk(3, dim=-1)
 
         pre_raw = pre_raw.view(B, T, n, n).float()
@@ -137,7 +137,7 @@ class SinkhornHyperConnection(nn.Module):
         B, T, n, D = streams.shape
 
         x_avg = streams.mean(dim=2)
-        gates = self.gate_proj(self.norm(x_avg.float()).to(streams.dtype))
+        gates = self.gate_proj(self.norm(x_avg).float().to(streams.dtype))
         pre_raw, post_raw, res_raw = gates.chunk(3, dim=-1)
 
         pre_raw = pre_raw.view(B, T, n, n).float()

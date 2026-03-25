@@ -22,6 +22,7 @@ Launch examples:
 import os
 import math
 import yaml
+from contextlib import nullcontext
 
 import torch
 import pydantic
@@ -210,7 +211,8 @@ def main(hydra_config: DictConfig):
     # ── Model ────────────────────────────────────────────────────────
     cfg = _build_model_config(config)
 
-    with accelerator.main_process_first():
+    ctx = accelerator.main_process_first() if accelerator.num_processes > 1 else nullcontext()
+    with ctx:
         accelerator.print("Creating model...")
         model = BaselineLM(cfg)
         n_params = sum(p.numel() for p in model.parameters())
@@ -262,7 +264,8 @@ def main(hydra_config: DictConfig):
         ml = total_loss / total_tok
         return ml, math.exp(min(ml, 100))
 
-    with accelerator.main_process_first():
+    ctx = accelerator.main_process_first() if accelerator.num_processes > 1 else nullcontext()
+    with ctx:
         accelerator.print("Loading dataset...")
         train_loader, eval_loader, tokenizer = create_dataloaders(
             dataset_name=config.dataset,
