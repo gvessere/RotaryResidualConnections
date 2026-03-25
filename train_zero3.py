@@ -102,7 +102,7 @@ class TrainConfig(pydantic.BaseModel):
 
     # W&B
     wandb: bool = False
-    wandb_project: str = "hyper-baseline"
+    wandb_project: str = "rotary-residuals"
     wandb_entity: str | None = None
     wandb_run: str | None = None
     wandb_id: str | None = None
