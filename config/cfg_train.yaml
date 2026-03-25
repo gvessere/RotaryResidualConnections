@@ -1,0 +1,79 @@
+# HyperBaseline training configuration
+#
+# Launch examples:
+#   accelerate launch train_zero3.py                         # vanilla baseline
+#   accelerate launch train_zero3.py arch=cayley             # Cayley HC
+#   accelerate launch train_zero3.py arch=sinkhorn           # Sinkhorn HC
+#   accelerate launch train_zero3.py arch=rotation           # Rotation HC
+#   accelerate launch train_zero3.py use_muon=true arch=cayley
+
+defaults:
+  - arch: vanilla
+  - _self_
+
+hydra:
+  output_subdir: null
+  run:
+    dir: .
+
+# ── Data ──────────────────────────────────────────────────────────────────
+dataset: EleutherAI/the_pile_deduplicated
+tokenizer: mistralai/Mistral-7B-v0.1
+eval_split: validation
+eval_from_train_examples: 10000
+
+# ── Training ──────────────────────────────────────────────────────────────
+batch_size: 3
+steps: 500000
+grad_accum: 43
+max_grad_norm: 1.0
+
+lr: 3e-4
+weight_decay: 0.1
+warmup_steps: 3000
+
+# ── Optimizer ─────────────────────────────────────────────────────────────
+# use_muon=true  → Muon (Linear weights) + AdamW (rest), DDP
+# use_muon=false → AdamW via DeepSpeed ZeRO-3
+use_muon: false
+muon_momentum: 0.95
+muon_ns_steps: 5
+muon_matched_rms: 0.2
+
+# DeepSpeed (only when use_muon=false)
+ds_config: ds/zero3_fp16.json
+
+# ── Logging ───────────────────────────────────────────────────────────────
+log_every: 50
+eval_every: 500
+eval_max_batches: 100
+eval_wikitext: true
+wikitext_dataset: Salesforce/wikitext
+wikitext_config: wikitext-103-raw-v1
+wikitext_split: validation
+
+# ── Checkpoints ───────────────────────────────────────────────────────────
+save_every: 500
+save_dir: checkpoints
+keep_last: 5
+
+# ── Resume ────────────────────────────────────────────────────────────────
+resume: null
+
+# ── S3 Checkpoint Storage ────────────────────────────────────────────────
+s3_bucket: ???
+s3_access_key: ???
+s3_secret_key: ???
+s3_region: null
+s3_endpoint_url: null
+s3_prefix: null
+
+# ── Weights & Biases ─────────────────────────────────────────────────────
+wandb: false
+wandb_project: rotary-residuals
+wandb_entity: null
+wandb_run: null
+wandb_id: null
+
+# ── Misc ──────────────────────────────────────────────────────────────────
+seed: 42

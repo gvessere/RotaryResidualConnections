@@ -1,0 +1,10 @@
+__pycache__/
+*.pyc
+*.egg-info/
+dist/
+build/
+checkpoints*/
+.wandb_*/
+wandb/
+*.pt
+.resume_s3_path

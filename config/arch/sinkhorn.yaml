@@ -1,0 +1,14 @@
+# mHC – Bistochastic manifold via Sinkhorn-Knopp iteration (arXiv:2512.24880)
+max_seq_len: 2048
+d_model: 1664
+n_heads: 32
+n_layers: 16
+d_ff: 4096
+gradient_checkpointing: true
+
+hc_type: sinkhorn
+hc_num_streams: 4
+hc_tau: 1.0
+hc_cayley_alpha: 0.1
+hc_cayley_iters: 2
+hc_sinkhorn_iters: 5
