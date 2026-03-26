@@ -6,7 +6,7 @@ n_layers: 16
 d_ff: 4096
 gradient_checkpointing: true
 
-hc_type: rotation
+hc_type: fixed_rotation
 hc_num_streams: 4
 hc_tau: 1.0
 hc_cayley_alpha: 0.1

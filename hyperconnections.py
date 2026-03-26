@@ -1,10 +1,11 @@
 """
 Hyper-Connection implementations for multi-stream residual mixing.
 
-Three variants:
-  1. CayleyHyperConnection   – Stiefel manifold via iterative Cayley transform  (JPmHC)
-  2. SinkhornHyperConnection – Bistochastic manifold via Sinkhorn-Knopp          (mHC)
-  3. RotationHyperConnection – Learned pre/post + fixed Givens residual          (experimental)
+Four variants:
+  1. CayleyHyperConnection            – Stiefel manifold via iterative Cayley transform  (JPmHC)
+  2. SinkhornHyperConnection          – Bistochastic manifold via Sinkhorn-Knopp          (mHC)
+  3. FixedRotationHyperConnection     – Global learned Givens rotation residual           (experimental)
+  4. AdaptiveRotationHyperConnection  – Data-dependent Givens rotation residual           (experimental)
 
 All operate on persistent multi-stream state [B, T, n, D]:
     forward(streams, sublayer_fn) -> new_streams
@@ -27,7 +28,8 @@ def create_hyper_connection(hc_type: str, hidden_size: int, **kwargs) -> nn.Modu
     constructors = {
         "cayley": CayleyHyperConnection,
         "sinkhorn": SinkhornHyperConnection,
-        "rotation": RotationHyperConnection,
+        "fixed_rotation": FixedRotationHyperConnection,
+        "adaptive_rotation": AdaptiveRotationHyperConnection,
     }
     if hc_type not in constructors:
         raise ValueError(f"Unknown hc_type '{hc_type}'. Choose from {list(constructors)}")
@@ -161,21 +163,22 @@ class SinkhornHyperConnection(nn.Module):
 
 
 # ---------------------------------------------------------------------------
-# 3. Rotation – Fixed Givens rotation matrices (experimental)
+# 3. FixedRotation – Global learned Givens rotation residual (experimental)
 # ---------------------------------------------------------------------------
 
-class RotationHyperConnection(nn.Module):
+class FixedRotationHyperConnection(nn.Module):
     """
-    Learned pre/post projections with a learnable orthogonal residual.
+    Learned pre/post projections with a single global orthogonal residual.
 
     Pre-connection:  row-stochastic   (softmax over cols, data-dependent)
     Post-connection: column-stochastic (softmax over rows, data-dependent)
-    Residual:        learnable rotation via full Givens decomposition
+    Residual:        global rotation via full Givens decomposition
 
     The residual is parameterised by n(n-1)/2 learnable angles — one per
     pair of streams — composed into a product of Givens rotations.  This
     can represent any element of SO(n) while staying exactly orthogonal by
-    construction.  Angles are initialised near zero (identity residual).
+    construction.  The same rotation is applied to every token and batch.
+    Angles are initialised near zero (identity residual).
     """
 
     def __init__(
@@ -256,5 +259,99 @@ class RotationHyperConnection(nn.Module):
         y_exp = y.unsqueeze(2).expand_as(streams)
         y_post = torch.einsum("btij,btjd->btid", h_post.to(streams.dtype), y_exp)
         s_res = torch.einsum("ij,btjd->btid", R, streams)
+
+        return s_res + y_post
+
+
+# ---------------------------------------------------------------------------
+# 4. AdaptiveRotation – Data-dependent Givens rotation residual (experimental)
+# ---------------------------------------------------------------------------
+
+class AdaptiveRotationHyperConnection(nn.Module):
+    """
+    Data-dependent pre/post/residual connections using Givens rotations.
+
+    Pre-connection:  row-stochastic   (softmax over cols, data-dependent)
+    Post-connection: column-stochastic (softmax over rows, data-dependent)
+    Residual:        data-dependent orthogonal rotation via Givens decomposition
+
+    The residual angles are predicted from the stream-averaged hidden state,
+    then composed into a product of Givens rotations.  The result is exactly
+    orthogonal (in SO(n)) by construction for every token.  The angle
+    projection is initialized near zero so training starts close to identity.
+    """
+
+    def __init__(
+        self,
+        hidden_size: int,
+        num_streams: int = 4,
+        tau: float = 1.0,
+        angle_init_std: float = 0.01,
+        **_kwargs,
+    ):
+        super().__init__()
+        self.num_streams = num_streams
+        self.tau = tau
+
+        self.norm = nn.LayerNorm(hidden_size)
+        self.gate_proj = nn.Linear(hidden_size, 2 * num_streams * num_streams, bias=True)
+
+        num_pairs = num_streams * (num_streams - 1) // 2
+        pairs = [(i, j) for i in range(num_streams) for j in range(i + 1, num_streams)]
+        self.register_buffer("_pairs", torch.tensor(pairs, dtype=torch.long), persistent=False)
+
+        self.angle_proj = nn.Linear(hidden_size, num_pairs, bias=True)
+        nn.init.normal_(self.angle_proj.weight, std=angle_init_std)
+        nn.init.zeros_(self.angle_proj.bias)
+
+    def _build_rotation(self, angles: torch.Tensor) -> torch.Tensor:
+        """Compose n(n-1)/2 Givens rotations from per-token angles.
+
+        angles: [B, T, num_pairs]  ->  returns [B, T, n, n]
+        """
+        n = self.num_streams
+        c = torch.cos(angles)
+        s = torch.sin(angles)
+
+        eye = torch.eye(n, dtype=c.dtype, device=c.device)
+        R = eye.expand(*angles.shape[:2], n, n)
+
+        for k in range(self._pairs.shape[0]):
+            i = self._pairs[k, 0].item()
+            j = self._pairs[k, 1].item()
+            G = eye.expand_as(R).clone()
+            G[..., i, i] = c[..., k]
+            G[..., i, j] = -s[..., k]
+            G[..., j, i] = s[..., k]
+            G[..., j, j] = c[..., k]
+            R = G @ R
+
+        return R
+
+    def forward(self, streams: torch.Tensor, sublayer_fn: Callable) -> torch.Tensor:
+        B, T, n, D = streams.shape
+
+        x_avg = streams.mean(dim=2)
+        normed = self.norm(x_avg).float().to(streams.dtype)
+        gates = self.gate_proj(normed)
+        pre_raw, post_raw = gates.chunk(2, dim=-1)
+
+        pre_raw = pre_raw.view(B, T, n, n).float()
+        post_raw = post_raw.view(B, T, n, n).float()
+
+        h_pre = torch.softmax(pre_raw / self.tau, dim=-1)
+        h_post = torch.softmax(post_raw / self.tau, dim=-2)
+
+        x_pre = torch.einsum("btij,btjd->btid", h_pre.to(streams.dtype), streams)
+        x_in = x_pre.mean(dim=2)
+
+        y = sublayer_fn(x_in)
+
+        angles = self.angle_proj(normed).float()
+        R = self._build_rotation(angles)
+
+        y_exp = y.unsqueeze(2).expand_as(streams)
+        y_post = torch.einsum("btij,btjd->btid", h_post.to(streams.dtype), y_exp)
+        s_res = torch.einsum("btij,btjd->btid", R.to(streams.dtype), streams)
 
         return s_res + y_post

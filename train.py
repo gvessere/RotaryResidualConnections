@@ -5,7 +5,8 @@ Usage:
     python train.py
     python train.py --hc_type cayley --hc_num_streams 4
     python train.py --hc_type sinkhorn
-    python train.py --hc_type rotation
+    python train.py --hc_type fixed_rotation
+    python train.py --hc_type adaptive_rotation
 """
 
 import math
@@ -59,7 +60,7 @@ def main():
 
     # HC
     parser.add_argument("--hc_type", default="none",
-                        choices=["none", "cayley", "sinkhorn", "rotation"])
+                        choices=["none", "cayley", "sinkhorn", "fixed_rotation", "adaptive_rotation"])
     parser.add_argument("--hc_num_streams", type=int, default=4)
     parser.add_argument("--hc_tau", type=float, default=1.0)
     parser.add_argument("--hc_cayley_alpha", type=float, default=0.1)

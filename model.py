@@ -2,10 +2,11 @@
 Baseline Transformer (GPT-style decoder-only) with optional Hyper-Connections.
 
 Hyper-connection modes (--hc_type):
-  none     – standard residual connections (vanilla transformer)
-  cayley   – JPmHC: Stiefel manifold via Cayley transform
-  sinkhorn – mHC: bistochastic manifold via Sinkhorn-Knopp iteration
-  rotation – fixed Givens rotation matrices (experimental)
+  none              – standard residual connections (vanilla transformer)
+  cayley            – JPmHC: Stiefel manifold via Cayley transform
+  sinkhorn          – mHC: bistochastic manifold via Sinkhorn-Knopp iteration
+  fixed_rotation    – global learned Givens rotation residual (experimental)
+  adaptive_rotation – data-dependent Givens rotation residual (experimental)
 """
 
 import math

@@ -93,7 +93,7 @@ With `hc_num_streams=4`, activation memory per block is ~4× the vanilla baselin
 | File | Purpose |
 |---|---|
 | `model.py` | `BaselineConfig`, `BaselineLM`, transformer blocks |
-| `hyperconnections.py` | `CayleyHyperConnection`, `SinkhornHyperConnection`, `RotationHyperConnection` |
+| `hyperconnections.py` | `CayleyHyperConnection`, `SinkhornHyperConnection`, `FixedRotationHyperConnection`, `AdaptiveRotationHyperConnection` |
 | `muon.py` | Muon optimizer (Newton-Schulz orthogonalisation for Linear weights) |
 | `data.py` | Pile dataset loading, tokenisation, DataLoaders |
 | `train.py` | Single-GPU training with AMP (argparse) |

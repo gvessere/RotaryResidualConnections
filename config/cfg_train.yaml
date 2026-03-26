@@ -4,7 +4,7 @@
 #   accelerate launch train_zero3.py                         # vanilla baseline
 #   accelerate launch train_zero3.py arch=cayley             # Cayley HC
 #   accelerate launch train_zero3.py arch=sinkhorn           # Sinkhorn HC
-#   accelerate launch train_zero3.py arch=rotation           # Rotation HC
+#   accelerate launch train_zero3.py arch=rotation           # Fixed Rotation HC
 #   accelerate launch train_zero3.py use_muon=true arch=cayley
 
 defaults:
