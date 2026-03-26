@@ -301,7 +301,7 @@ class AdaptiveRotationHyperConnection(nn.Module):
         self.register_buffer("_pairs", torch.tensor(pairs, dtype=torch.long), persistent=False)
 
         self.angle_proj = nn.Linear(hidden_size, num_pairs, bias=True)
-        nn.init.normal_(self.angle_proj.weight, std=angle_init_std)
+        nn.init.normal_(self.angle_proj.weight, std=angle_init_std / math.sqrt(hidden_size))
         nn.init.zeros_(self.angle_proj.bias)
 
     def _build_rotation(self, angles: torch.Tensor) -> torch.Tensor:
