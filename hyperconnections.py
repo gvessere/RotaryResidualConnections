@@ -4,7 +4,7 @@ Hyper-Connection implementations for multi-stream residual mixing.
 Three variants:
   1. CayleyHyperConnection   – Stiefel manifold via iterative Cayley transform  (JPmHC)
   2. SinkhornHyperConnection – Bistochastic manifold via Sinkhorn-Knopp          (mHC)
-  3. RotationHyperConnection – Fixed Givens rotation matrices                    (experimental)
+  3. RotationHyperConnection – Learned pre/post + fixed Givens residual          (experimental)
 
 All operate on persistent multi-stream state [B, T, n, D]:
     forward(streams, sublayer_fn) -> new_streams
@@ -166,29 +166,33 @@ class SinkhornHyperConnection(nn.Module):
 
 class RotationHyperConnection(nn.Module):
     """
-    Hard-coded orthogonal mixing via paired Givens rotations.
+    Learned pre/post projections with a fixed orthogonal residual.
+
+    Pre-connection:  row-stochastic   (softmax over cols, data-dependent)
+    Post-connection: column-stochastic (softmax over rows, data-dependent)
+    Residual:        fixed Givens rotation matrix
 
     Angle theta = pi / (2 * num_streams) ensures mild, geometry-aware
     cross-stream coupling that grows more conservative with more streams.
-    Pre uses R, post uses R^T (inverse), residual uses R.
-
-    No learnable parameters in the connection matrices; diversity across
-    streams emerges from differing row-sums of the orthogonal matrix.
     """
 
     def __init__(
         self,
         hidden_size: int,
         num_streams: int = 4,
+        tau: float = 1.0,
         **_kwargs,
     ):
         super().__init__()
         self.num_streams = num_streams
+        self.tau = tau
+
+        self.norm = nn.LayerNorm(hidden_size)
+        self.gate_proj = nn.Linear(hidden_size, 2 * num_streams * num_streams, bias=True)
 
         theta = math.pi / (2.0 * num_streams)
         R = self._build_givens_rotation(num_streams, theta)
-        self.register_buffer("R_fwd", R, persistent=False)
-        self.register_buffer("R_inv", R.t().contiguous(), persistent=False)
+        self.register_buffer("R", R, persistent=False)
 
     @staticmethod
     def _build_givens_rotation(n: int, theta: float) -> torch.Tensor:
@@ -202,17 +206,25 @@ class RotationHyperConnection(nn.Module):
         return R
 
     def forward(self, streams: torch.Tensor, sublayer_fn: Callable) -> torch.Tensor:
-        dtype = streams.dtype
-        R = self.R_fwd.to(dtype)
-        R_inv = self.R_inv.to(dtype)
+        B, T, n, D = streams.shape
 
-        x_pre = torch.einsum("ij,btjd->btid", R, streams)
+        x_avg = streams.mean(dim=2)
+        gates = self.gate_proj(self.norm(x_avg).float().to(streams.dtype))
+        pre_raw, post_raw = gates.chunk(2, dim=-1)
+
+        pre_raw = pre_raw.view(B, T, n, n).float()
+        post_raw = post_raw.view(B, T, n, n).float()
+
+        h_pre = torch.softmax(pre_raw / self.tau, dim=-1)
+        h_post = torch.softmax(post_raw / self.tau, dim=-2)
+
+        x_pre = torch.einsum("btij,btjd->btid", h_pre.to(streams.dtype), streams)
         x_in = x_pre.mean(dim=2)
 
         y = sublayer_fn(x_in)
 
         y_exp = y.unsqueeze(2).expand_as(streams)
-        y_post = torch.einsum("ij,btjd->btid", R_inv, y_exp)
-        s_res = torch.einsum("ij,btjd->btid", R, streams)
+        y_post = torch.einsum("btij,btjd->btid", h_post.to(streams.dtype), y_exp)
+        s_res = torch.einsum("ij,btjd->btid", self.R.to(streams.dtype), streams)
 
         return s_res + y_post
