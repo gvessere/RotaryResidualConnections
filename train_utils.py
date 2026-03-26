@@ -59,14 +59,22 @@ def _download_from_s3(s3_uri: str, local_dir: str, s3_config: Dict[str, Any], ac
 
 
 def upload_accel_state_to_s3(state_dir: str, s3_config: Dict[str, Any], accelerator):
-    """Tar+gzip an accelerator state directory and upload it to S3."""
+    """Tar+gzip an accelerator state directory and upload it to S3.
+
+    To limit peak disk usage, the source directory is removed as soon as the
+    tar.gz archive is complete (before upload), since the archive is the only
+    copy needed for the upload.  The caller is responsible for keeping or
+    re-downloading the directory if it is needed later.
+    """
     tar_path = state_dir + ".tar.gz"
     with tarfile.open(tar_path, "w:gz") as tar:
         tar.add(state_dir, arcname=os.path.basename(state_dir))
+    shutil.rmtree(state_dir, ignore_errors=True)
     try:
         _upload_to_s3(tar_path, s3_config, accelerator)
     finally:
-        os.remove(tar_path)
+        if os.path.exists(tar_path):
+            os.remove(tar_path)
 
 
 def _download_and_extract_accel_tar(
@@ -183,22 +191,33 @@ def save_checkpoint(
 def _cleanup_old_checkpoints(save_dir, prefix, keep_last, accelerator):
     pattern = os.path.join(save_dir, f"{prefix}_*.pt")
     ckpts = glob.glob(pattern)
-    if len(ckpts) <= keep_last:
-        return
 
-    def _step(p):
-        m = re.search(rf"{prefix}_(\d+)\.pt$", p)
-        return int(m.group(1)) if m else 0
+    kept_stems = set()
+    if len(ckpts) > keep_last:
+        def _step(p):
+            m = re.search(rf"{prefix}_(\d+)\.pt$", p)
+            return int(m.group(1)) if m else 0
 
-    for old in sorted(ckpts, key=_step, reverse=True)[keep_last:]:
-        try:
-            os.remove(old)
-            state_dir = old.replace(".pt", "_accel")
-            if os.path.isdir(state_dir):
-                shutil.rmtree(state_dir)
-            accelerator.print(f"[cleanup] Removed {os.path.basename(old)}")
-        except OSError:
-            pass
+        by_step = sorted(ckpts, key=_step, reverse=True)
+        kept_stems = {os.path.splitext(p)[0] for p in by_step[:keep_last]}
+        for old in by_step[keep_last:]:
+            try:
+                os.remove(old)
+                accelerator.print(f"[cleanup] Removed {os.path.basename(old)}")
+            except OSError:
+                pass
+    else:
+        kept_stems = {os.path.splitext(p)[0] for p in ckpts}
+
+    accel_dirs = glob.glob(os.path.join(save_dir, f"{prefix}_*_accel"))
+    for d in accel_dirs:
+        stem = d.removesuffix("_accel")
+        if stem not in kept_stems:
+            try:
+                shutil.rmtree(d)
+                accelerator.print(f"[cleanup] Removed {os.path.basename(d)}")
+            except OSError:
+                pass
 
 
 # ── Loading / resume ─────────────────────────────────────────────────────

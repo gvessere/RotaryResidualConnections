@@ -446,6 +446,7 @@ def main(hydra_config: DictConfig):
                         upload_accel_state_to_s3(state_dir, s3_config, accelerator)
                     except Exception as e:
                         accelerator.print(f"[s3] Accel state upload failed: {e}")
+                        shutil.rmtree(state_dir, ignore_errors=True)
 
     finish_wandb(accelerator, wandb_active)
     accelerator.print("Training complete!")
