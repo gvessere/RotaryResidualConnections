@@ -134,15 +134,16 @@ class _HyperConnectionBase(nn.Module):
         normed = self.norm(x_avg).float()
 
         # H_pre: σ(α·(x̃'·φ) + b)  — non-negative, data-dependent (Eq 7-8)
-        dyn_pre = F.linear(normed, self._dyn_pre_w) * self._dyn_pre_scale
-        h_pre = torch.sigmoid(self.static_pre + dyn_pre)
+        # .float() on params: DeepSpeed ZeRO casts params to fp16/bf16
+        dyn_pre = F.linear(normed, self._dyn_pre_w.float()) * self._dyn_pre_scale.float()
+        h_pre = torch.sigmoid(self.static_pre.float() + dyn_pre)
 
         x_in = torch.einsum("btn, btnd -> btd", h_pre.to(streams.dtype), streams)
         y = sublayer_fn(x_in)
 
         # H_post: 2σ(α·(x̃'·φ) + b)  — non-negative, data-dependent (Eq 8)
-        dyn_post = F.linear(normed, self._dyn_post_w) * self._dyn_post_scale
-        h_post = 2.0 * torch.sigmoid(self.static_post + dyn_post)
+        dyn_post = F.linear(normed, self._dyn_post_w.float()) * self._dyn_post_scale.float()
+        h_post = 2.0 * torch.sigmoid(self.static_post.float() + dyn_post)
 
         # H_res: variant-specific constrained matrix (computed in fp32)
         h_res = self._compute_h_res(normed)
@@ -278,8 +279,8 @@ class SinkhornHyperConnection(_HyperConnectionBase):
 
     def _compute_h_res(self, normed: torch.Tensor) -> torch.Tensor:
         n = self.num_streams
-        dyn = F.linear(normed, self._dyn_res_w) * self._dyn_res_scale
-        logits = self.static_res + dyn.unflatten(-1, (n, n))
+        dyn = F.linear(normed, self._dyn_res_w.float()) * self._dyn_res_scale.float()
+        logits = self.static_res.float() + dyn.unflatten(-1, (n, n))
         return sinkhorn_log(logits, self.sinkhorn_iters, self.sinkhorn_tau)
 
     def _collect_variant_stats(
@@ -326,8 +327,8 @@ class CayleyHyperConnection(_HyperConnectionBase):
 
     def _compute_h_res(self, normed: torch.Tensor) -> torch.Tensor:
         n = self.num_streams
-        dyn = F.linear(normed, self._dyn_res_w) * self._dyn_res_scale
-        raw = self.static_res + dyn.unflatten(-1, (n, n))
+        dyn = F.linear(normed, self._dyn_res_w.float()) * self._dyn_res_scale.float()
+        raw = self.static_res.float() + dyn.unflatten(-1, (n, n))
 
         W = raw - raw.transpose(-1, -2)
         I = self._I.to(dtype=W.dtype)
@@ -380,8 +381,8 @@ class FixedRotationHyperConnection(_HyperConnectionBase):
 
         n = self.num_streams
         num_pairs = self._pairs.shape[0]
-        c = torch.cos(self.angles)
-        s = torch.sin(self.angles)
+        c = torch.cos(self.angles.float())
+        s = torch.sin(self.angles.float())
 
         eye = torch.eye(n, dtype=c.dtype, device=c.device)
         G = eye.unsqueeze(0).expand(num_pairs, -1, -1).clone()
@@ -470,7 +471,7 @@ class AdaptiveRotationHyperConnection(_HyperConnectionBase):
         return R
 
     def _compute_h_res(self, normed: torch.Tensor) -> torch.Tensor:
-        angles = F.linear(normed, self._angle_w, self._angle_b)
+        angles = F.linear(normed, self._angle_w.float(), self._angle_b.float())
         return self._build_rotation(angles)
 
     def _collect_variant_stats(
