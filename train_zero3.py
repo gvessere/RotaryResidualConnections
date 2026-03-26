@@ -21,6 +21,7 @@ Launch examples:
 
 import os
 import math
+import shutil
 import yaml
 from contextlib import nullcontext
 
@@ -175,6 +176,25 @@ def _save_resolved_config(config: TrainConfig, save_dir: str):
         pass
 
 
+def _accel_state_dir(pt_path: str) -> str:
+    return pt_path.replace(".pt", "_accel")
+
+
+def _fast_forward_ds_scheduler(accelerator, model, steps):
+    """Step the DeepSpeed LR scheduler forward when engine state is unavailable."""
+    sched = getattr(model, "lr_scheduler", None)
+    if sched is None:
+        engine = getattr(accelerator, "deepspeed_engine", None)
+        if engine is not None:
+            sched = getattr(engine, "lr_scheduler", None)
+    if sched is not None:
+        for _ in range(steps):
+            sched.step()
+        accelerator.print(f"[resume] Fast-forwarded LR scheduler by {steps} steps")
+    else:
+        accelerator.print("[resume] WARNING: Could not locate DeepSpeed LR scheduler")
+
+
 # ── Main ──────────────────────────────────────────────────────────────────
 
 @hydra.main(config_path="config", config_name="cfg_train", version_base=None)
@@ -315,10 +335,22 @@ def main(hydra_config: DictConfig):
 
     restore_data_state(accelerator, train_loader, data_state)
 
-    if opt_state is not None and optimizer is not None:
+    # Restore optimizer + scheduler state after prepare
+    if resume_path and not config.use_muon:
+        state_dir = _accel_state_dir(resume_path)
+        if os.path.isdir(state_dir):
+            accelerator.load_state(state_dir)
+            accelerator.print("[resume] Restored full engine state (optimizer + scheduler)")
+        elif start_step > 0:
+            accelerator.print(
+                "[resume] WARNING: No engine state dir found — "
+                "optimizer moments lost, fast-forwarding LR scheduler"
+            )
+            _fast_forward_ds_scheduler(accelerator, model, start_step)
+    elif opt_state is not None and optimizer is not None:
         try:
             optimizer.load_state_dict(opt_state)
-            accelerator.print("[resume] Restored optimizer state")
+            accelerator.print("[resume] Restored Muon optimizer state")
         except Exception as e:
             accelerator.print(f"[resume] Could not restore optimizer state: {e}")
     del opt_state
@@ -416,13 +448,17 @@ def main(hydra_config: DictConfig):
         # ── Checkpointing ────────────────────────────────────────────
         if config.save_dir and step % config.save_every == 0:
             ds = capture_data_state(accelerator, train_loader)
-            save_checkpoint(
+            ckpt_path = save_checkpoint(
                 accelerator=accelerator, model=model, config=cfg,
                 step=step, save_dir=config.save_dir,
                 prefix=ckpt_prefix,
                 keep_last=config.keep_last, data_state=ds,
                 optimizer=optimizer, s3_config=s3_config,
             )
+            if not config.use_muon and ckpt_path is not None:
+                state_dir = _accel_state_dir(ckpt_path)
+                accelerator.save_state(state_dir)
+                accelerator.print(f"[save] Engine state saved to {state_dir}")
 
     finish_wandb(accelerator, wandb_active)
     accelerator.print("Training complete!")

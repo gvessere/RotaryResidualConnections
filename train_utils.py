@@ -5,6 +5,7 @@ Shared training utilities: checkpointing, S3 storage, W&B logging, CLI args, res
 import os
 import re
 import glob
+import shutil
 from typing import Optional, Any, Dict, Tuple
 
 import torch
@@ -162,6 +163,9 @@ def _cleanup_old_checkpoints(save_dir, prefix, keep_last, accelerator):
     for old in sorted(ckpts, key=_step, reverse=True)[keep_last:]:
         try:
             os.remove(old)
+            state_dir = old.replace(".pt", "_accel")
+            if os.path.isdir(state_dir):
+                shutil.rmtree(state_dir)
             accelerator.print(f"[cleanup] Removed {os.path.basename(old)}")
         except OSError:
             pass
