@@ -134,10 +134,10 @@ def _build_model_config(config: TrainConfig) -> BaselineConfig:
         tie_embeddings=False,
         hc_type=a.hc_type,
         hc_num_streams=a.hc_num_streams,
-        hc_tau=a.hc_tau,
+        hc_sinkhorn_tau=a.hc_sinkhorn_tau,
+        hc_sinkhorn_iters=a.hc_sinkhorn_iters,
         hc_cayley_alpha=a.hc_cayley_alpha,
         hc_cayley_iters=a.hc_cayley_iters,
-        hc_sinkhorn_iters=a.hc_sinkhorn_iters,
     )
 
 

@@ -62,10 +62,10 @@ def main():
     parser.add_argument("--hc_type", default="none",
                         choices=["none", "cayley", "sinkhorn", "fixed_rotation", "adaptive_rotation"])
     parser.add_argument("--hc_num_streams", type=int, default=4)
-    parser.add_argument("--hc_tau", type=float, default=1.0)
+    parser.add_argument("--hc_sinkhorn_tau", type=float, default=1.0)
+    parser.add_argument("--hc_sinkhorn_iters", type=int, default=20)
     parser.add_argument("--hc_cayley_alpha", type=float, default=0.1)
     parser.add_argument("--hc_cayley_iters", type=int, default=2)
-    parser.add_argument("--hc_sinkhorn_iters", type=int, default=5)
 
     # Training
     parser.add_argument("--steps", type=int, default=10000)
@@ -87,9 +87,8 @@ def main():
         d_ff=args.d_ff, max_seq_len=args.max_seq_len,
         gradient_checkpointing=args.gradient_checkpointing,
         hc_type=args.hc_type, hc_num_streams=args.hc_num_streams,
-        hc_tau=args.hc_tau, hc_cayley_alpha=args.hc_cayley_alpha,
-        hc_cayley_iters=args.hc_cayley_iters,
-        hc_sinkhorn_iters=args.hc_sinkhorn_iters,
+        hc_sinkhorn_tau=args.hc_sinkhorn_tau, hc_sinkhorn_iters=args.hc_sinkhorn_iters,
+        hc_cayley_alpha=args.hc_cayley_alpha, hc_cayley_iters=args.hc_cayley_iters,
     )
 
     print("Loading data...")

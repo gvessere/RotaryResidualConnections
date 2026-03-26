@@ -8,7 +8,7 @@ gradient_checkpointing: true
 
 hc_type: fixed_rotation
 hc_num_streams: 4
-hc_tau: 1.0
+hc_sinkhorn_tau: 1.0
+hc_sinkhorn_iters: 20
 hc_cayley_alpha: 0.1
 hc_cayley_iters: 2
-hc_sinkhorn_iters: 5

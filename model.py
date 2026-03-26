@@ -38,10 +38,10 @@ class BaselineConfig:
     # Hyper-connections
     hc_type: str = "none"
     hc_num_streams: int = 4
-    hc_tau: float = 1.0
+    hc_sinkhorn_tau: float = 1.0
+    hc_sinkhorn_iters: int = 20
     hc_cayley_alpha: float = 0.1
     hc_cayley_iters: int = 2
-    hc_sinkhorn_iters: int = 5
 
     eos_token_id: Optional[int] = None
     pad_token_id: Optional[int] = None
@@ -142,10 +142,10 @@ class TransformerBlock(nn.Module):
         if self.use_hc:
             hc_kw = dict(
                 num_streams=cfg.hc_num_streams,
-                tau=cfg.hc_tau,
+                sinkhorn_tau=cfg.hc_sinkhorn_tau,
+                sinkhorn_iters=cfg.hc_sinkhorn_iters,
                 cayley_alpha=cfg.hc_cayley_alpha,
                 cayley_iters=cfg.hc_cayley_iters,
-                sinkhorn_iters=cfg.hc_sinkhorn_iters,
             )
             self.hc_attn = create_hyper_connection(cfg.hc_type, cfg.d_model, **hc_kw)
             self.hc_mlp = create_hyper_connection(cfg.hc_type, cfg.d_model, **hc_kw)
