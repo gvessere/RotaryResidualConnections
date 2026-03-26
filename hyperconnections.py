@@ -166,14 +166,16 @@ class SinkhornHyperConnection(nn.Module):
 
 class RotationHyperConnection(nn.Module):
     """
-    Learned pre/post projections with a fixed orthogonal residual.
+    Learned pre/post projections with a learnable orthogonal residual.
 
     Pre-connection:  row-stochastic   (softmax over cols, data-dependent)
     Post-connection: column-stochastic (softmax over rows, data-dependent)
-    Residual:        fixed Givens rotation matrix
+    Residual:        learnable rotation via full Givens decomposition
 
-    Angle theta = pi / (2 * num_streams) ensures mild, geometry-aware
-    cross-stream coupling that grows more conservative with more streams.
+    The residual is parameterised by n(n-1)/2 learnable angles — one per
+    pair of streams — composed into a product of Givens rotations.  This
+    can represent any element of SO(n) while staying exactly orthogonal by
+    construction.  Angles are initialised near zero (identity residual).
     """
 
     def __init__(
@@ -181,6 +183,7 @@ class RotationHyperConnection(nn.Module):
         hidden_size: int,
         num_streams: int = 4,
         tau: float = 1.0,
+        angle_init_std: float = 0.01,
         **_kwargs,
     ):
         super().__init__()
@@ -190,20 +193,46 @@ class RotationHyperConnection(nn.Module):
         self.norm = nn.LayerNorm(hidden_size)
         self.gate_proj = nn.Linear(hidden_size, 2 * num_streams * num_streams, bias=True)
 
-        theta = math.pi / (2.0 * num_streams)
-        R = self._build_givens_rotation(num_streams, theta)
-        self.register_buffer("R", R, persistent=False)
+        pairs = [(i, j) for i in range(num_streams) for j in range(i + 1, num_streams)]
+        self.register_buffer("_pairs", torch.tensor(pairs, dtype=torch.long), persistent=False)
+        self.angles = nn.Parameter(torch.randn(len(pairs)) * angle_init_std)
+        self._cached_R: torch.Tensor | None = None
 
-    @staticmethod
-    def _build_givens_rotation(n: int, theta: float) -> torch.Tensor:
-        R = torch.eye(n, dtype=torch.float32)
-        c, s = math.cos(theta), math.sin(theta)
-        for i in range(0, n - 1, 2):
-            R[i, i] = c
-            R[i, i + 1] = -s
-            R[i + 1, i] = s
-            R[i + 1, i + 1] = c
+    def _build_rotation(self) -> torch.Tensor:
+        """Compose all n(n-1)/2 Givens rotations into a single SO(n) matrix.
+
+        Batch-constructs every Givens matrix in one tensor, then sequentially
+        multiplies them.  The result is cached during eval (angles are frozen).
+        """
+        if not self.training and self._cached_R is not None:
+            return self._cached_R
+
+        n = self.num_streams
+        num_pairs = self._pairs.shape[0]
+        c = torch.cos(self.angles)
+        s = torch.sin(self.angles)
+
+        eye = torch.eye(n, dtype=c.dtype, device=c.device)
+        G = eye.unsqueeze(0).expand(num_pairs, -1, -1).clone()
+        idx = torch.arange(num_pairs, device=c.device)
+        pi, pj = self._pairs[:, 0], self._pairs[:, 1]
+        G[idx, pi, pi] = c
+        G[idx, pi, pj] = -s
+        G[idx, pj, pi] = s
+        G[idx, pj, pj] = c
+
+        R = G[0]
+        for k in range(1, num_pairs):
+            R = G[k] @ R
+
+        if not self.training:
+            self._cached_R = R
         return R
+
+    def train(self, mode: bool = True):
+        if mode:
+            self._cached_R = None
+        return super().train(mode)
 
     def forward(self, streams: torch.Tensor, sublayer_fn: Callable) -> torch.Tensor:
         B, T, n, D = streams.shape
@@ -223,8 +252,9 @@ class RotationHyperConnection(nn.Module):
 
         y = sublayer_fn(x_in)
 
+        R = self._build_rotation().to(streams.dtype)
         y_exp = y.unsqueeze(2).expand_as(streams)
         y_post = torch.einsum("btij,btjd->btid", h_post.to(streams.dtype), y_exp)
-        s_res = torch.einsum("ij,btjd->btid", self.R.to(streams.dtype), streams)
+        s_res = torch.einsum("ij,btjd->btid", R, streams)
 
         return s_res + y_post
