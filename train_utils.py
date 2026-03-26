@@ -6,6 +6,7 @@ import os
 import re
 import glob
 import shutil
+import tarfile
 from typing import Optional, Any, Dict, Tuple
 
 import torch
@@ -57,6 +58,33 @@ def _download_from_s3(s3_uri: str, local_dir: str, s3_config: Dict[str, Any], ac
     return local_path
 
 
+def upload_accel_state_to_s3(state_dir: str, s3_config: Dict[str, Any], accelerator):
+    """Tar+gzip an accelerator state directory and upload it to S3."""
+    tar_path = state_dir + ".tar.gz"
+    with tarfile.open(tar_path, "w:gz") as tar:
+        tar.add(state_dir, arcname=os.path.basename(state_dir))
+    try:
+        _upload_to_s3(tar_path, s3_config, accelerator)
+    finally:
+        os.remove(tar_path)
+
+
+def _download_and_extract_accel_tar(
+    s3_uri: str, local_dir: str, s3_config: Dict[str, Any], accelerator,
+) -> str:
+    """Download a compressed accel state tarball from S3 and extract it."""
+    tar_path = _download_from_s3(s3_uri, local_dir, s3_config, accelerator)
+    with tarfile.open(tar_path, "r:gz") as tar:
+        try:
+            tar.extractall(path=local_dir, filter="data")
+        except TypeError:
+            tar.extractall(path=local_dir)
+    extracted = tar_path.removesuffix(".tar.gz")
+    os.remove(tar_path)
+    accelerator.print(f"[s3] Extracted accel state → {extracted}")
+    return extracted
+
+
 def _cleanup_old_s3_checkpoints(s3_config, ckpt_prefix, keep_last, accelerator):
     client = _build_s3_client(s3_config)
     bucket = s3_config["bucket"]
@@ -80,6 +108,8 @@ def _cleanup_old_s3_checkpoints(s3_config, ckpt_prefix, keep_last, accelerator):
     for old in sorted(pt_objects, key=_step, reverse=True)[keep_last:]:
         try:
             client.delete_object(Bucket=bucket, Key=old["Key"])
+            tar_key = old["Key"].replace(".pt", "_accel.tar.gz")
+            client.delete_object(Bucket=bucket, Key=tar_key)
             accelerator.print(f"[s3:cleanup] Deleted s3://{bucket}/{old['Key']}")
         except Exception:
             pass
@@ -273,6 +303,8 @@ def resolve_resume_checkpoint(accelerator, args, s3_config=None):
 
     if accelerator.is_main_process:
         local = _download_from_s3(resume, save_root, s3_config, accelerator)
+        tar_uri = resume.replace(".pt", "_accel.tar.gz")
+        _download_and_extract_accel_tar(tar_uri, save_root, s3_config, accelerator)
         with open(shared_path, "w") as f:
             f.write(local)
 
