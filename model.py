@@ -196,6 +196,12 @@ class BaselineLM(nn.Module):
         elif isinstance(module, nn.Embedding):
             torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
 
+    def _extract_repr(self, h: torch.Tensor) -> torch.Tensor:
+        """Extract a [B, T, D] representation for stats (stream 0 for HC)."""
+        if self.use_hc and h.ndim == 4:
+            return h[:, :, 0, :]
+        return h
+
     def forward(
         self,
         input_ids: torch.Tensor,
@@ -203,21 +209,53 @@ class BaselineLM(nn.Module):
     ) -> Dict[str, torch.Tensor]:
         x = self.embed(input_ids)  # [B, T, D]
 
+        collect = getattr(self, "collect_block_stats", False)
+        prev_repr: Optional[torch.Tensor] = None
+        block_stats: Dict[str, float] = {}
+
         if self.use_hc:
-            # [B, T, 1, D] + [n, D] -> [B, T, n, D]
             streams = x.unsqueeze(2) + self.stream_init
-            for block in self.blocks:
+            for i, block in enumerate(self.blocks):
+                if collect:
+                    r = self._extract_repr(streams).float().detach()
+                    block_stats[f"block/L{i}/input_rms"] = r.pow(2).mean().sqrt().item()
+                    if prev_repr is not None:
+                        block_stats[f"block/L{i}/cosine_sim_prev"] = (
+                            F.cosine_similarity(prev_repr, r, dim=-1).mean().item()
+                        )
+                    prev_repr = r
                 if self.gradient_checkpointing and self.training:
                     streams = checkpoint(block, streams, use_reentrant=False)
                 else:
                     streams = block(streams)
             x = streams.mean(dim=2)
         else:
-            for block in self.blocks:
+            for i, block in enumerate(self.blocks):
+                if collect:
+                    r = x.float().detach()
+                    block_stats[f"block/L{i}/input_rms"] = r.pow(2).mean().sqrt().item()
+                    if prev_repr is not None:
+                        block_stats[f"block/L{i}/cosine_sim_prev"] = (
+                            F.cosine_similarity(prev_repr, r, dim=-1).mean().item()
+                        )
+                    prev_repr = r
                 if self.gradient_checkpointing and self.training:
                     x = checkpoint(block, x, use_reentrant=False)
                 else:
                     x = block(x)
+
+        if collect:
+            r = (x if not self.use_hc else x).float().detach()
+            block_stats[f"block/final/output_rms"] = r.pow(2).mean().sqrt().item()
+            if prev_repr is not None:
+                block_stats[f"block/final/cosine_sim_prev"] = (
+                    F.cosine_similarity(prev_repr, r, dim=-1).mean().item()
+                )
+            cos_vals = [v for k, v in block_stats.items() if "cosine_sim" in k]
+            if cos_vals:
+                block_stats["block/mean_cosine_sim"] = sum(cos_vals) / len(cos_vals)
+                block_stats["block/max_cosine_sim"] = max(cos_vals)
+            self.last_block_stats = block_stats
 
         x = self.ln_f(x)
         logits = self.lm_head(x)

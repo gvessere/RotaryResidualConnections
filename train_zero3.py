@@ -196,23 +196,36 @@ def _get_hc_modules(model):
     return out
 
 
-def _set_hc_collect_stats(model, enable: bool):
-    for _, _, mod in _get_hc_modules(model):
-        mod.collect_stats = enable
+def _unwrap_model(model):
+    raw = model
+    while hasattr(raw, "module"):
+        raw = raw.module
+    return raw
 
 
-def _gather_hc_stats(model) -> dict:
-    """Collect per-layer stats + composite stats into a flat wandb-friendly dict."""
-    hc_mods = _get_hc_modules(model)
-    stats = {}
-    for layer, name, mod in hc_mods:
-        for k, v in getattr(mod, "last_stats", {}).items():
-            stats[f"hc/L{layer}_{name}/{k}"] = v
+def _set_collect_stats(model, enable: bool, use_hc: bool):
+    """Enable/disable stats collection on block-level and HC modules."""
+    raw = _unwrap_model(model)
+    raw.collect_block_stats = enable
+    if use_hc:
+        for _, _, mod in _get_hc_modules(model):
+            mod.collect_stats = enable
 
-    all_mods = [mod for _, _, mod in hc_mods]
-    composite = compute_composite_h_res_stats(all_mods)
-    for k, v in composite.items():
-        stats[f"hc/{k}"] = v
+
+def _gather_all_stats(model, use_hc: bool) -> dict:
+    """Collect block-level stats (all archs) + HC-specific stats into a flat dict."""
+    raw = _unwrap_model(model)
+    stats = dict(getattr(raw, "last_block_stats", {}))
+
+    if use_hc:
+        hc_mods = _get_hc_modules(model)
+        for layer, name, mod in hc_mods:
+            for k, v in getattr(mod, "last_stats", {}).items():
+                stats[f"hc/L{layer}_{name}/{k}"] = v
+        all_mods = [mod for _, _, mod in hc_mods]
+        composite = compute_composite_h_res_stats(all_mods)
+        for k, v in composite.items():
+            stats[f"hc/{k}"] = v
 
     return stats
 
@@ -399,8 +412,8 @@ def main(hydra_config: DictConfig):
                 pg["lr"] = lr
 
         is_log_step = step % config.log_every == 0
-        if is_log_step and use_hc:
-            _set_hc_collect_stats(model, True)
+        if is_log_step:
+            _set_collect_stats(model, True, use_hc)
 
         with accelerator.accumulate(model):
             out = model(**batch)
@@ -411,10 +424,10 @@ def main(hydra_config: DictConfig):
                 optimizer.step()
                 optimizer.zero_grad()
 
-        hc_stats = {}
-        if is_log_step and use_hc:
-            hc_stats = _gather_hc_stats(model)
-            _set_hc_collect_stats(model, False)
+        diag_stats = {}
+        if is_log_step:
+            diag_stats = _gather_all_stats(model, use_hc)
+            _set_collect_stats(model, False, use_hc)
 
         running_loss += out["loss"].item()
         tokens_local += batch["labels"].numel()
@@ -440,7 +453,7 @@ def main(hydra_config: DictConfig):
                 "train/tokens_seen": tokens_global,
                 "train/lr": current_lr,
             }
-            metrics.update(hc_stats)
+            metrics.update(diag_stats)
             log_wandb(accelerator, metrics, step, wandb_active)
             running_loss = 0.0
 
