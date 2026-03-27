@@ -381,6 +381,14 @@ def main(hydra_config: DictConfig):
             )
         accelerator.load_state(state_dir)
         accelerator.print("[resume] Restored full engine state (optimizer + scheduler)")
+        if accelerator.is_main_process:
+            try:
+                shutil.rmtree(state_dir, ignore_errors=True)
+                if os.path.isfile(resume_path):
+                    os.remove(resume_path)
+                accelerator.print(f"[cleanup] Removed resumed checkpoint files from disk")
+            except OSError:
+                pass
     elif opt_state is not None and optimizer is not None:
         optimizer.load_state_dict(opt_state)
         accelerator.print("[resume] Restored Muon optimizer state")
@@ -467,24 +475,30 @@ def main(hydra_config: DictConfig):
             ).item())
 
             if eval_loader is not None:
-                ml, ppl = run_eval(eval_loader, config.eval_max_batches)
-                if ml is not None:
-                    accelerator.print(f"[eval] step {step} | loss {ml:.4f} | ppl {ppl:.2f}")
-                    log_wandb(accelerator, {
-                        "eval/loss": ml, "eval/ppl": ppl,
-                        "eval/optimizer_step": opt_step,
-                        "eval/tokens_seen": tokens_global,
-                    }, step, wandb_active)
+                try:
+                    ml, ppl = run_eval(eval_loader, config.eval_max_batches)
+                    if ml is not None:
+                        accelerator.print(f"[eval] step {step} | loss {ml:.4f} | ppl {ppl:.2f}")
+                        log_wandb(accelerator, {
+                            "eval/loss": ml, "eval/ppl": ppl,
+                            "eval/optimizer_step": opt_step,
+                            "eval/tokens_seen": tokens_global,
+                        }, step, wandb_active)
+                except Exception as e:
+                    accelerator.print(f"[eval] step {step} skipped due to error: {e}")
 
             if wikitext_eval_loader is not None:
-                wl, wp = run_eval(wikitext_eval_loader, config.eval_max_batches)
-                if wl is not None:
-                    accelerator.print(f"[eval:wikitext] step {step} | loss {wl:.4f} | ppl {wp:.2f}")
-                    log_wandb(accelerator, {
-                        "eval_wikitext/loss": wl, "eval_wikitext/ppl": wp,
-                        "eval_wikitext/optimizer_step": opt_step,
-                        "eval_wikitext/tokens_seen": tokens_global,
-                    }, step, wandb_active)
+                try:
+                    wl, wp = run_eval(wikitext_eval_loader, config.eval_max_batches)
+                    if wl is not None:
+                        accelerator.print(f"[eval:wikitext] step {step} | loss {wl:.4f} | ppl {wp:.2f}")
+                        log_wandb(accelerator, {
+                            "eval_wikitext/loss": wl, "eval_wikitext/ppl": wp,
+                            "eval_wikitext/optimizer_step": opt_step,
+                            "eval_wikitext/tokens_seen": tokens_global,
+                        }, step, wandb_active)
+                except Exception as e:
+                    accelerator.print(f"[eval:wikitext] step {step} skipped due to error: {e}")
 
             model.train()
 

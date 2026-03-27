@@ -279,6 +279,11 @@ def save_checkpoint(
                     key = f"{s3_prefix}/{os.path.basename(path)}"
                     client.upload_file(path, bucket, key)
                     print_fn(f"[s3:async] Uploaded → s3://{bucket}/{key}")
+                    try:
+                        os.remove(path)
+                        print_fn(f"[cleanup] Removed local {os.path.basename(path)}")
+                    except OSError:
+                        pass
                     if kl > 0:
                         _cleanup_old_s3_checkpoints(s3cfg, pfx, kl, print_fn)
                 except Exception as exc:
@@ -314,13 +319,21 @@ def _cleanup_old_checkpoints(save_dir, prefix, keep_last, accelerator):
     else:
         kept_stems = {os.path.splitext(p)[0] for p in ckpts}
 
-    accel_dirs = glob.glob(os.path.join(save_dir, f"{prefix}_*_accel"))
-    for d in accel_dirs:
+    for d in glob.glob(os.path.join(save_dir, f"{prefix}_*_accel")):
         stem = d.removesuffix("_accel")
         if stem not in kept_stems:
             try:
                 shutil.rmtree(d)
                 accelerator.print(f"[cleanup] Removed {os.path.basename(d)}")
+            except OSError:
+                pass
+
+    for f in glob.glob(os.path.join(save_dir, f"{prefix}_*_accel.tar.gz")):
+        stem = f.removesuffix("_accel.tar.gz")
+        if stem not in kept_stems:
+            try:
+                os.remove(f)
+                accelerator.print(f"[cleanup] Removed {os.path.basename(f)}")
             except OSError:
                 pass
 
