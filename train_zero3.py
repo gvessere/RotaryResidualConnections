@@ -39,7 +39,9 @@ from train_utils import (
     resolve_resume_checkpoint, upload_accel_state_to_s3,
     init_wandb, log_wandb, finish_wandb,
     capture_data_state, restore_data_state,
+    flush_async_uploads, shutdown_async_persister,
 )
+from hyperconnections import compute_composite_h_res_stats
 
 
 # ── Pydantic config schema ───────────────────────────────────────────────
@@ -179,6 +181,40 @@ def _save_resolved_config(config: TrainConfig, save_dir: str):
 
 def _accel_state_dir(pt_path: str) -> str:
     return pt_path.replace(".pt", "_accel")
+
+
+def _get_hc_modules(model):
+    """Return [(layer_idx, 'attn'|'mlp', module), ...] for all HC modules."""
+    raw = model
+    while hasattr(raw, "module"):
+        raw = raw.module
+    out = []
+    for i, block in enumerate(raw.blocks):
+        if getattr(block, "use_hc", False):
+            out.append((i, "attn", block.hc_attn))
+            out.append((i, "mlp", block.hc_mlp))
+    return out
+
+
+def _set_hc_collect_stats(model, enable: bool):
+    for _, _, mod in _get_hc_modules(model):
+        mod.collect_stats = enable
+
+
+def _gather_hc_stats(model) -> dict:
+    """Collect per-layer stats + composite stats into a flat wandb-friendly dict."""
+    hc_mods = _get_hc_modules(model)
+    stats = {}
+    for layer, name, mod in hc_mods:
+        for k, v in getattr(mod, "last_stats", {}).items():
+            stats[f"hc/L{layer}_{name}/{k}"] = v
+
+    all_mods = [mod for _, _, mod in hc_mods]
+    composite = compute_composite_h_res_stats(all_mods)
+    for k, v in composite.items():
+        stats[f"hc/{k}"] = v
+
+    return stats
 
 
 
@@ -347,6 +383,7 @@ def main(hydra_config: DictConfig):
     it = iter(train_loader)
     running_loss = 0.0
     tokens_local = start_step * config.batch_size * cfg.max_seq_len
+    use_hc = cfg.hc_type != "none"
 
     for step in range(start_step + 1, config.steps + 1):
         try:
@@ -361,6 +398,10 @@ def main(hydra_config: DictConfig):
             for pg in optimizer.param_groups:
                 pg["lr"] = lr
 
+        is_log_step = step % config.log_every == 0
+        if is_log_step and use_hc:
+            _set_hc_collect_stats(model, True)
+
         with accelerator.accumulate(model):
             out = model(**batch)
             accelerator.backward(out["loss"])
@@ -370,30 +411,37 @@ def main(hydra_config: DictConfig):
                 optimizer.step()
                 optimizer.zero_grad()
 
+        hc_stats = {}
+        if is_log_step and use_hc:
+            hc_stats = _gather_hc_stats(model)
+            _set_hc_collect_stats(model, False)
+
         running_loss += out["loss"].item()
         tokens_local += batch["labels"].numel()
 
         # ── Logging ──────────────────────────────────────────────────
-        if step % config.log_every == 0:
+        if is_log_step:
             opt_step = step // config.grad_accum
             tokens_global = int(accelerator.reduce(
                 torch.tensor(tokens_local, device=accelerator.device, dtype=torch.long),
                 reduction="sum",
             ).item())
 
-        if accelerator.is_main_process and step % config.log_every == 0:
+        if accelerator.is_main_process and is_log_step:
             avg = running_loss / config.log_every
             current_lr = lr if config.use_muon else config.lr
             accelerator.print(
                 f"step {step:6d} | opt {opt_step:6d} | tok {tokens_global:,} "
                 f"| loss {avg:.4f} | lr {current_lr:.2e}"
             )
-            log_wandb(accelerator, {
+            metrics = {
                 "train/loss_lm": avg,
                 "train/optimizer_step": opt_step,
                 "train/tokens_seen": tokens_global,
                 "train/lr": current_lr,
-            }, step, wandb_active)
+            }
+            metrics.update(hc_stats)
+            log_wandb(accelerator, metrics, step, wandb_active)
             running_loss = 0.0
 
         # ── Evaluation ───────────────────────────────────────────────
@@ -429,6 +477,7 @@ def main(hydra_config: DictConfig):
 
         # ── Checkpointing ────────────────────────────────────────────
         if config.save_dir and step % config.save_every == 0:
+            flush_async_uploads(accelerator)
             ds = capture_data_state(accelerator, train_loader)
             save_checkpoint(
                 accelerator=accelerator, model=model, config=cfg,
@@ -442,12 +491,10 @@ def main(hydra_config: DictConfig):
                 accelerator.save_state(state_dir)
                 accelerator.print(f"[save] Engine state → {state_dir}")
                 if s3_config is not None and accelerator.is_main_process:
-                    try:
-                        upload_accel_state_to_s3(state_dir, s3_config, accelerator)
-                    except Exception as e:
-                        accelerator.print(f"[s3] Accel state upload failed: {e}")
-                        shutil.rmtree(state_dir, ignore_errors=True)
+                    upload_accel_state_to_s3(state_dir, s3_config, accelerator)
 
+    flush_async_uploads(accelerator)
+    shutdown_async_persister()
     finish_wandb(accelerator, wandb_active)
     accelerator.print("Training complete!")
 

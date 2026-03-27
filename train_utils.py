@@ -7,7 +7,9 @@ import re
 import glob
 import shutil
 import tarfile
-from typing import Optional, Any, Dict, Tuple
+import threading
+import concurrent.futures
+from typing import Optional, Any, Dict, List, Tuple
 
 import torch
 import torch.distributed as dist
@@ -58,14 +60,105 @@ def _download_from_s3(s3_uri: str, local_dir: str, s3_config: Dict[str, Any], ac
     return local_path
 
 
-def upload_accel_state_to_s3(state_dir: str, s3_config: Dict[str, Any], accelerator):
+class AsyncPersister:
+    """Background thread pool for checkpoint compression and S3 uploads.
+
+    Offloads tar+gzip and boto3 uploads so the training loop is not blocked.
+    Call flush() before shutdown or when you need to guarantee prior work is done.
+    """
+
+    def __init__(self, max_workers: int = 2):
+        self._executor = concurrent.futures.ThreadPoolExecutor(max_workers=max_workers)
+        self._futures: List[concurrent.futures.Future] = []
+        self._lock = threading.Lock()
+
+    def submit(self, fn, *args, **kwargs) -> concurrent.futures.Future:
+        with self._lock:
+            self._futures = [f for f in self._futures if not f.done()]
+            future = self._executor.submit(fn, *args, **kwargs)
+            self._futures.append(future)
+        return future
+
+    def flush(self, timeout: Optional[float] = None) -> List[str]:
+        """Wait for all pending tasks.  Returns list of error messages (if any)."""
+        with self._lock:
+            pending = list(self._futures)
+        concurrent.futures.wait(pending, timeout=timeout)
+        errors = []
+        for f in pending:
+            if f.done() and f.exception() is not None:
+                errors.append(str(f.exception()))
+        with self._lock:
+            self._futures = [f for f in self._futures if not f.done()]
+        return errors
+
+    def shutdown(self, wait: bool = True):
+        self._executor.shutdown(wait=wait)
+
+
+_async_persister: Optional[AsyncPersister] = None
+
+
+def get_async_persister() -> AsyncPersister:
+    global _async_persister
+    if _async_persister is None:
+        _async_persister = AsyncPersister()
+    return _async_persister
+
+
+def flush_async_uploads(accelerator=None) -> List[str]:
+    """Block until all background uploads finish.  Returns error messages."""
+    if _async_persister is None:
+        return []
+    errors = _async_persister.flush()
+    if errors and accelerator is not None:
+        for e in errors:
+            accelerator.print(f"[async] Background task failed: {e}")
+    return errors
+
+
+def shutdown_async_persister():
+    global _async_persister
+    if _async_persister is not None:
+        _async_persister.shutdown(wait=True)
+        _async_persister = None
+
+
+def _tar_upload_cleanup(state_dir: str, s3_config: Dict[str, Any], print_fn):
+    """Synchronous tar+gzip+upload+cleanup — meant to run in a background thread."""
+    tar_path = state_dir + ".tar.gz"
+    try:
+        with tarfile.open(tar_path, "w:gz") as tar:
+            tar.add(state_dir, arcname=os.path.basename(state_dir))
+        shutil.rmtree(state_dir, ignore_errors=True)
+        client = _build_s3_client(s3_config)
+        bucket = s3_config["bucket"]
+        prefix = s3_config.get("prefix", "checkpoints")
+        key = f"{prefix}/{os.path.basename(tar_path)}"
+        client.upload_file(tar_path, bucket, key)
+        print_fn(f"[s3:async] Uploaded → s3://{bucket}/{key}")
+    finally:
+        if os.path.exists(tar_path):
+            os.remove(tar_path)
+
+
+def upload_accel_state_to_s3(
+    state_dir: str,
+    s3_config: Dict[str, Any],
+    accelerator,
+    async_upload: bool = True,
+):
     """Tar+gzip an accelerator state directory and upload it to S3.
 
-    To limit peak disk usage, the source directory is removed as soon as the
-    tar.gz archive is complete (before upload), since the archive is the only
-    copy needed for the upload.  The caller is responsible for keeping or
-    re-downloading the directory if it is needed later.
+    When async_upload=True (default), the work runs in a background thread
+    so the training loop is not blocked.
     """
+    if async_upload:
+        persister = get_async_persister()
+        persister.submit(_tar_upload_cleanup, state_dir, s3_config, accelerator.print)
+        accelerator.print(f"[s3:async] Queued upload for {os.path.basename(state_dir)}")
+        return
+
     tar_path = state_dir + ".tar.gz"
     with tarfile.open(tar_path, "w:gz") as tar:
         tar.add(state_dir, arcname=os.path.basename(state_dir))
@@ -93,7 +186,7 @@ def _download_and_extract_accel_tar(
     return extracted
 
 
-def _cleanup_old_s3_checkpoints(s3_config, ckpt_prefix, keep_last, accelerator):
+def _cleanup_old_s3_checkpoints(s3_config, ckpt_prefix, keep_last, print_fn):
     client = _build_s3_client(s3_config)
     bucket = s3_config["bucket"]
     s3_prefix = s3_config.get("prefix", "checkpoints")
@@ -118,7 +211,7 @@ def _cleanup_old_s3_checkpoints(s3_config, ckpt_prefix, keep_last, accelerator):
             client.delete_object(Bucket=bucket, Key=old["Key"])
             tar_key = old["Key"].replace(".pt", "_accel.tar.gz")
             client.delete_object(Bucket=bucket, Key=tar_key)
-            accelerator.print(f"[s3:cleanup] Deleted s3://{bucket}/{old['Key']}")
+            print_fn(f"[s3:cleanup] Deleted s3://{bucket}/{old['Key']}")
         except Exception:
             pass
 
@@ -178,12 +271,24 @@ def save_checkpoint(
             _cleanup_old_checkpoints(save_dir, prefix, keep_last, accelerator)
 
         if s3_config is not None:
-            try:
-                _upload_to_s3(ckpt_path, s3_config, accelerator)
-                if keep_last > 0:
-                    _cleanup_old_s3_checkpoints(s3_config, prefix, keep_last, accelerator)
-            except Exception as e:
-                accelerator.print(f"[s3] Upload failed: {e}")
+            def _bg_upload_pt(path, s3cfg, pfx, kl, print_fn):
+                try:
+                    client = _build_s3_client(s3cfg)
+                    bucket = s3cfg["bucket"]
+                    s3_prefix = s3cfg.get("prefix", "checkpoints")
+                    key = f"{s3_prefix}/{os.path.basename(path)}"
+                    client.upload_file(path, bucket, key)
+                    print_fn(f"[s3:async] Uploaded → s3://{bucket}/{key}")
+                    if kl > 0:
+                        _cleanup_old_s3_checkpoints(s3cfg, pfx, kl, print_fn)
+                except Exception as exc:
+                    print_fn(f"[s3:async] Upload failed: {exc}")
+
+            persister = get_async_persister()
+            persister.submit(
+                _bg_upload_pt, ckpt_path, s3_config, prefix, keep_last, accelerator.print,
+            )
+            accelerator.print(f"[s3:async] Queued .pt upload for step {step}")
 
     return ckpt_path
 
