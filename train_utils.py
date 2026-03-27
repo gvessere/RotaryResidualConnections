@@ -124,13 +124,28 @@ def shutdown_async_persister():
         _async_persister = None
 
 
+def _tar_dir_incremental(state_dir: str, tar_path: str):
+    """Create tar.gz, deleting each source file after it's added to free disk."""
+    base = os.path.basename(state_dir)
+    parent = os.path.dirname(state_dir)
+    with tarfile.open(tar_path, "w:gz") as tar:
+        for root, dirs, files in os.walk(state_dir):
+            rel_root = os.path.relpath(root, parent)
+            tar_info = tar.gettarinfo(root, arcname=rel_root)
+            tar.addfile(tar_info)
+            for fname in files:
+                fpath = os.path.join(root, fname)
+                arcname = os.path.join(rel_root, fname)
+                tar.add(fpath, arcname=arcname)
+                os.remove(fpath)
+    shutil.rmtree(state_dir, ignore_errors=True)
+
+
 def _tar_upload_cleanup(state_dir: str, s3_config: Dict[str, Any], print_fn):
     """Synchronous tar+gzip+upload+cleanup — meant to run in a background thread."""
     tar_path = state_dir + ".tar.gz"
     try:
-        with tarfile.open(tar_path, "w:gz") as tar:
-            tar.add(state_dir, arcname=os.path.basename(state_dir))
-        shutil.rmtree(state_dir, ignore_errors=True)
+        _tar_dir_incremental(state_dir, tar_path)
         client = _build_s3_client(s3_config)
         bucket = s3_config["bucket"]
         prefix = s3_config.get("prefix", "checkpoints")
@@ -160,9 +175,7 @@ def upload_accel_state_to_s3(
         return
 
     tar_path = state_dir + ".tar.gz"
-    with tarfile.open(tar_path, "w:gz") as tar:
-        tar.add(state_dir, arcname=os.path.basename(state_dir))
-    shutil.rmtree(state_dir, ignore_errors=True)
+    _tar_dir_incremental(state_dir, tar_path)
     try:
         _upload_to_s3(tar_path, s3_config, accelerator)
     finally:
